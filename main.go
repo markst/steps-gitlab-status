@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"net/http"
@@ -18,15 +20,16 @@ import (
 type config struct {
 	PrivateToken  string `env:"private_token,required"`
 	RepositoryURL string `env:"repository_url,required"`
-	GitRef        string `env:"git_ref"`
-	CommitHash    string `env:"commit_hash,required"`
+	GitRef        string `env:"git_ref,required"` // Git branch or tag
 	APIURL        string `env:"api_base_url,required"`
 
+	CommitHash  string  `env:"commit_hash,required"`
 	Status      string  `env:"preset_status,opt[auto,pending,running,success,failed,canceled]"`
 	TargetURL   string  `env:"target_url"`
 	Context     string  `env:"context"`
 	Description string  `env:"description"`
 	Coverage    float64 `env:"coverage,range[0.0..100.0]"`
+	PipelineID  string  `env:"pipeline_id"`
 }
 
 // getRepo parses the repository from a url
@@ -99,6 +102,61 @@ func sendStatus(cfg config) error {
 	return err
 }
 
+// triggerPipeline triggers a GitLab pipeline.
+// see also: https://docs.gitlab.com/ee/api/pipelines.html#create-a-new-pipeline
+func triggerPipeline(cfg config) error {
+	repo := url.PathEscape(getRepo(cfg.RepositoryURL))
+	apiURL := fmt.Sprintf("%s/projects/%s/trigger/pipeline", cfg.APIURL, repo)
+
+	data := map[string]string{
+		"token": cfg.PrivateToken,
+		"ref":   cfg.GitRef,
+	}
+
+	// Add variables if needed
+	var variables = map[string]string{
+		"BITRISE_API_TOKEN":  os.Getenv("BITRISE_API_TOKEN"),
+		"BITRISE_APP_SLUG":   os.Getenv("BITRISE_APP_SLUG"),
+		"BITRISE_BUILD_SLUG": os.Getenv("BITRISE_BUILD_SLUG"),
+	}
+	for key, value := range variables {
+		if value != "" {
+			data[fmt.Sprintf("variables[%s]", key)] = value
+		}
+	}
+
+	// Convert data to form-encoded
+	form := url.Values{}
+	for key, value := range data {
+		form.Set(key, value)
+	}
+
+	req, err := http.NewRequest("POST", apiURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %s", err)
+	}
+	req.Header.Add("PRIVATE-TOKEN", cfg.PrivateToken)
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send the request: %s", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response body: %s", err)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("server error: %s url: %s code: %d body: %s", resp.Status, apiURL, resp.StatusCode, string(body))
+	}
+
+	log.Infof("Pipeline triggered successfully: %s", string(body))
+	return nil
+}
+
 func main() {
 	if os.Getenv("commit_hash") == "" {
 		log.Warnf("GitLab requires a commit hash for build status reporting")
@@ -112,6 +170,13 @@ func main() {
 	}
 	stepconf.Print(cfg)
 
+	// Trigger pipeline
+	if err := triggerPipeline(cfg); err != nil {
+		log.Errorf("Failed to trigger pipeline, error: %s", err)
+		os.Exit(1)
+	}
+
+	// Retry sending status
 	if err := retry.Times(3).Wait(5 * time.Second).Try(func(attempt uint) error {
 		if attempt > 0 {
 			log.Warnf("%d attempt failed", attempt)
